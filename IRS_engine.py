@@ -34,12 +34,24 @@ class Curve:
             Curve2Discount:   Conversion of any given zero curve to discount factors
             CurveShift:       Curve shift of any given Curve object by specified basis points
     '''
+    def Discrete2Continuous(self,curve,compound_freq):
+        df = getattr(self,curve)
+        return np.log(pow((1+(df*compound_freq/36000)),360/compound_freq)) * 100
+        
+    def Continuous2Discrete(self,curve,compound_freq):
+        df = getattr(self,curve)
+        return (pow(np.exp(df/100),compound_freq/360)-1)*36000/compound_freq
+    
+    def Continuous2DiscreteDF(self,df):
+        compound_freq = self.compound_freq
+        return (pow(np.exp(df/100),compound_freq/360)-1)*36000/compound_freq
     
     def __init__(self, curve_df,compound_freq):
         
         self.curve_df = curve_df
         self.max_dtm = curve_df.Dtm.max()
         self.compound_freq = compound_freq
+        
         
         def Interpolate3M(df):
             for d in np.arange(90,self.max_dtm,90):
@@ -51,18 +63,19 @@ class Curve:
         def ZeroCurve(df):
             zero_df = pd.Series(index = df.index,name='Rate')
             zero_df.loc[:compound_freq] = df.loc[:compound_freq]
-            self.discount_factor.loc[:compound_freq] = 1/pow((1+zero_df.loc[:compound_freq]/100),zero_df.loc[:compound_freq].index/360)
+            self.discount_factor.loc[:compound_freq] = np.exp(-zero_df.loc[:compound_freq]*zero_df.loc[:compound_freq].index /36000)
             
-            for d in zero_df.loc[compound_freq+90:].index:
+            dtm_to_bootstrap  = list(zero_df.loc[compound_freq:].index[1:])
+            for d in dtm_to_bootstrap:
                 d_prev = d - 90
                 bootstrap_pv = 0
-                int_payment = df.loc[d] * (90/360) /100
+                int_payment = np.exp(df.loc[d] * (90/360) /100) - 1
                 while d_prev>0:
                     bootstrap_pv += int_payment * self.discount_factor.loc[d_prev]
                     d_prev -= 90
-                    
+
                 self.discount_factor.loc[d] = (1 - bootstrap_pv) /(1 + int_payment)
-                zero_df.loc[d] = (pow(1/self.discount_factor.loc[d],360/d) -1 ) * 100 
+                zero_df.loc[d] = -np.log(self.discount_factor.loc[d])*(360/d) * 100
             
             return zero_df
     
@@ -71,11 +84,12 @@ class Curve:
             fwd_df.loc[0] = df.loc[90]
             
             for d in np.arange(90,self.max_dtm,90):
-                fwd_df.loc[d] = (pow(pow((1+df.loc[d+90]/100),(d+90)/360) / pow((1+df.loc[d]/100),(d)/360),4) - 1 ) * 100
+                fwd_df.loc[d] = (np.log(np.exp(df.loc[d+90] * (d+90)/36000) / np.exp(df.loc[d] * (d)/36000)) * 4) *100 
             
             return fwd_df
             
         self.yield_curve = Interpolate3M(curve_df.set_index('Dtm')['Rate'])
+        self.yield_curve = self.Discrete2Continuous('yield_curve',compound_freq)
         self.discount_factor = pd.Series(index=self.yield_curve.index,name='Rate')
         self.zero_curve = ZeroCurve(self.yield_curve)
         self.fwd_curve = FwdCurve(self.zero_curve)
@@ -85,7 +99,7 @@ class Curve:
         return pd.Series(np.interp(dtm,df_to_interpolate.index,list(df_to_interpolate)),index=[dtm],name='Rate')
     
     def Curve2Discount(self,curve,dtm):
-        return np.reciprocal(np.power((1+np.array(curve)/100),np.array(dtm)/360))
+        return np.exp(-np.array(curve) * (np.array(dtm)/360)/100)
     
     def CurveShift(self,shift):
         curve_df = copy.deepcopy(self.curve_df)
@@ -127,7 +141,7 @@ class IRS:
         
                 
         def ScheduleGenerator(self):
-            
+        
             schedule = list()
             schedule.append(self.start_date)
             new_date = self.start_date + relativedelta(months=3)
@@ -144,15 +158,16 @@ class IRS:
         elif self.amortisation_type =='Linear':
             self.amortisation_schedule = [notional - (i/self.num_of_payments)*notional for i in range(self.num_of_payments)]
         elif self.amortisation_type =='Custom':
-            if len(amortisation_schedule)==self.num_of_payments:
-                self.amortisation_schedule  = amortisation_schedule
-            else:
-                print('Amortisation schedule is not suitable with the given swap parameters. Linear amortisation is applied instead')
+            try:
+                if len(amortisation_schedule) == self.num_of_payments:
+                    self.amortisation_schedule  = amortisation_schedule
+            except:
+                print('No amortisation schedule is provided or provided schedule is not suitable with the given swap parameters. Linear amortisation is applied instead')
                 self.amortisation_schedule = [notional - (i/self.num_of_payments)*notional for i in range(self.num_of_payments)]
 
             
     def CalculateValue(self,par):
-    
+        
         df = pd.DataFrame(index = range(self.num_of_payments),columns=['Period_Start','Period_End','Dtm','Notional','Reset_Rate','Zero_Rate','Discount_Factor',
                                    'Interest_Payment_Float','Payment_PV','Fixed_Rate','Fixed_Payment',
                                    'Fixed_Payment_PV'])
@@ -164,10 +179,10 @@ class IRS:
         df.Reset_Rate  = list(self.fwd_curve.Interpolate('fwd_curve',df.Dtm))
         df.Zero_Rate = list(self.discount_curve.Interpolate('zero_curve',df.Dtm))
         df.Discount_Factor= list(self.discount_curve.Curve2Discount(df.Zero_Rate,df.Dtm))
-        df.Interest_Payment_Float = df.Notional * df.Reset_Rate/100 * (90/360)
+        df.Interest_Payment_Float = df.Notional * (np.exp(df.Reset_Rate/100 * (90/360))-1)
         df.Payment_PV = df.Interest_Payment_Float * df.Discount_Factor
         df.Fixed_Rate = np.ones(len(df))*par
-        df.Fixed_Payment = df.Notional * df.Fixed_Rate/100 * (90/360)
+        df.Fixed_Payment = df.Notional * (np.exp(df.Fixed_Rate/100 * (90/360))-1)
         df.Fixed_Payment_PV = df.Fixed_Payment * df.Discount_Factor
 
         
@@ -178,12 +193,13 @@ class IRS:
         r0=1
         pv = lambda r: self.CalculateValue(r)
         res= opt.root(pv, r0, method="hybr")        
-        return res.x[0]
+        return self.fwd_curve.Continuous2DiscreteDF(res.x[0])
     
         
 
 ### main
 def main():
+    
     today= pd.to_datetime('2019/11/04',dayfirst=False)
     
     #read curves
@@ -193,10 +209,10 @@ def main():
     eur_ois_df = pd.read_csv(r'Curves/EUR_OIS.csv')    
     
     #curve objects
-    US_Libor = Curve(us_libor_df,compound_freq = 180)
-    US_OIS = Curve(us_ois_df,compound_freq = 1)
-    Euribor = Curve(euribor_df,compound_freq = 180)
-    EUR_OIS = Curve(eur_ois_df,compound_freq = 1)    
+    US_Libor = Curve(us_libor_df,compound_freq = 90)
+    US_OIS = Curve(us_ois_df,compound_freq = 90)
+    Euribor = Curve(euribor_df,compound_freq = 90)
+    EUR_OIS = Curve(eur_ois_df,compound_freq = 90)    
     
     #already issued swap with 1.5 years of remaining maturity
     start_date = pd.to_datetime('2019/06/01',dayfirst=False)
@@ -210,7 +226,7 @@ def main():
     notional  = 10000000
     schedule = [notional,notional*7/8,notional*3/4,notional*5/8,notional*1/2,
                 notional*3/8,notional*1/4,notional*1/8]
-    usd_irs2 = IRS(Libor,Libor,notional,today,start_date,end_date,amortisation_type='Custom',
+    usd_irs2 = IRS(US_Libor,US_OIS,notional,today,start_date,end_date,amortisation_type='Custom',
                    amortisation_schedule=schedule)
     usd_irs2_value = usd_irs2.CalculateValue(par=3)
     
@@ -218,22 +234,21 @@ def main():
     #spot starting swap with 5 years of maturity and linear amortisation
     start_date = pd.to_datetime('2019/11/06',dayfirst=False)
     end_date =  pd.to_datetime('2024/11/06',dayfirst=False)
-    usd_irs3 = IRS(Libor,Libor,10000000,today,start_date,end_date,amortisation_type='Linear')
+    usd_irs3 = IRS(US_Libor,US_OIS,10000000,today,start_date,end_date,amortisation_type='Linear')
     usd_irs3_price = usd_irs3.CalculatePar()
     
-   
     
     #already started 20yr IRS with no amortisation and fixed rate of 2.1%
     start_date = pd.to_datetime('2018/12/01',dayfirst=False)
     end_date =  pd.to_datetime('2039/12/01',dayfirst=False)
-    usd_irs4 = IRS(Libor,Libor,10000000,today,start_date,end_date,'Constant')
+    usd_irs4 = IRS(US_Libor,US_OIS,10000000,today,start_date,end_date,'Constant')
     usd_irs4_value = usd_irs4.CalculateValue(2.1)
     
-    Libor_100_up  = Libor.CurveShift(100)
-    Libor_100_down  = Libor.CurveShift(-100)
+    Libor_100_up  = US_Libor.CurveShift(100)
+    Libor_100_down  = US_Libor.CurveShift(-100)
     
-    usd_irs4_price_delta_up  = IRS(Libor_100_up,Libor,10000000,today,start_date,end_date,'Constant').CalculateValue(2.1)- usd_irs4_value
-    usd_irs4_price_delta_down  = IRS(Libor_100_down,Libor,10000000,today,start_date,end_date,'Constant').CalculateValue(2.1)- usd_irs4_value    
+    usd_irs4_price_delta_up  = IRS(Libor_100_up,US_OIS,10000000,today,start_date,end_date,'Constant').CalculateValue(2.1)- usd_irs4_value
+    usd_irs4_price_delta_down  = IRS(Libor_100_down,US_OIS,10000000,today,start_date,end_date,'Constant').CalculateValue(2.1)- usd_irs4_value    
 
 ### start main
 if __name__ == "__main__":
